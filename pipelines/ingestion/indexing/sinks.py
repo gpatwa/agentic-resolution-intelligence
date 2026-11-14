@@ -27,16 +27,19 @@ def build_vector_sinks(environ: Mapping[str, str]) -> list[Any]:
 
         if parse_sweep_flag(environ):
             raise ValueError("INGEST_OPENSEARCH_SWEEP is on but opensearch is not in INGEST_VECTOR_SINKS")
+    from pipelines.ingestion.options import tenant_id as resolve_tenant
+
+    tenant = resolve_tenant(environ)
     sinks: list[Any] = []
     for name in names:
         if name == "qdrant":
             from pipelines.ingestion.indexing.qdrant import QdrantIndexer
 
-            sinks.append(QdrantIndexer())
+            sinks.append(QdrantIndexer(tenant_id=tenant))
         else:
             from pipelines.ingestion.indexing.opensearch import OpenSearchIndexer
 
-            sinks.append(OpenSearchIndexer())
+            sinks.append(OpenSearchIndexer(tenant_id=tenant))
     return sinks
 
 

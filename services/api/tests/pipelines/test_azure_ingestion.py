@@ -339,3 +339,21 @@ def test_the_ingest_script_waits_for_the_head_pod_to_appear_after_resuming_the_c
     resume = text.index("set_suspend false")
     assert text.index("for _ in $(seq 1 90); do", resume) < text.index('kubectl wait --for=condition=Ready "pod/$head"')
     assert "the Ray head pod did not appear" in text
+
+
+# ----- tenant plumbing ---------------------------------------------------------------------------------------------------
+
+
+def test_the_tenant_comes_from_the_environment_and_defaults() -> None:
+    from pipelines.ingestion.options import tenant_id
+
+    assert tenant_id({"TENANT_ID": " acme "}) == "acme"
+    assert tenant_id({}) == "default" and tenant_id({"TENANT_ID": ""}) == "default"
+
+
+def test_the_vector_sink_is_built_for_the_requested_tenant(monkeypatch) -> None:
+    from pipelines.ingestion.indexing.sinks import build_vector_sinks
+
+    sinks = build_vector_sinks({"TENANT_ID": "acme"})
+    assert sinks[0].tenant_id == "acme"
+    assert build_vector_sinks({})[0].tenant_id == "default"
