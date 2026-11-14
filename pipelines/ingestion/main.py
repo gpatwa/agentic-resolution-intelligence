@@ -14,7 +14,7 @@ from pipelines.ingestion.indexing.ray_sink import write_rows
 from pipelines.ingestion.indexing.sinks import build_vector_sinks, finalize_sinks
 from pipelines.ingestion.loaders.pdf import parse_pdf_bytes
 from pipelines.ingestion.loaders.source import read_source
-from pipelines.ingestion.options import embed_num_gpus, graph_num_gpus, int_env
+from pipelines.ingestion.options import embed_num_gpus, graph_num_gpus, int_env, tenant_id
 
 # Initialize Ray (Connect to the existing cluster)
 ray.init(address="auto")
@@ -129,7 +129,7 @@ def main(bucket_name: str, prefix: str):
     for sink in vector_sinks:
         write_rows(vector_ds, sink)
     if graph_ds is not None:
-        write_rows(graph_ds, Neo4jIndexer())
+        write_rows(graph_ds, Neo4jIndexer(tenant_id=tenant_id(os.environ)))
 
     # Only reached when every write above succeeded; an error here fails the job but loses nothing.
     for report in finalize_sinks(vector_sinks):
