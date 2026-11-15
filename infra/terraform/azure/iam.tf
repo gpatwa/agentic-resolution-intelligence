@@ -84,3 +84,15 @@ resource "azurerm_federated_identity_credential" "ray_federated" {
   issuer              = azurerm_kubernetes_cluster.aks.oidc_issuer_url
   subject             = "system:serviceaccount:default:ray-worker"
 }
+
+# The automatic-ingestion CronJob (deploy/ray/ingest-sweeper-azure.yaml) reads the documents container and keeps its state
+# blob there with the same identity as the Ray pods, from its own service account (so it can have Kubernetes rights the
+# Ray pods do not).
+resource "azurerm_federated_identity_credential" "ingest_sweeper_federated" {
+  name                = "ingest-sweeper-federated-credential"
+  resource_group_name = azurerm_resource_group.main.name
+  parent_id           = azurerm_user_assigned_identity.ray_identity.id
+  audience            = ["api://AzureADTokenExchange"]
+  issuer              = azurerm_kubernetes_cluster.aks.oidc_issuer_url
+  subject             = "system:serviceaccount:default:ingest-sweeper"
+}
