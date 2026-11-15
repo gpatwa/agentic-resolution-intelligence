@@ -7,6 +7,17 @@ from neo4j import GraphDatabase
 DEFAULT_TENANT_ID = "default"
 
 
+def clean_graph(nodes, edges):
+    """Drop what the LLM got wrong so one malformed item cannot fail the whole write: nodes need a name, edges need both
+    ends, and an edge without a type becomes ``RELATES_TO`` (Cypher cannot MERGE on a null property)."""
+    good_nodes = [n for n in nodes if isinstance(n, dict) and n.get("id")]
+    good_edges = []
+    for e in edges:
+        if isinstance(e, dict) and e.get("source") and e.get("target"):
+            good_edges.append({**e, "type": e.get("type") or "RELATES_TO"})
+    return good_nodes, good_edges
+
+
 class Neo4jIndexer:
     """
     Writes data to Neo4j Graph Database.
@@ -56,6 +67,7 @@ class Neo4jIndexer:
             if "graph_edges" in row:
                 all_edges.extend(row["graph_edges"])
 
+        all_nodes, all_edges = clean_graph(all_nodes, all_edges)
         if not all_nodes and not all_edges:
             return
 

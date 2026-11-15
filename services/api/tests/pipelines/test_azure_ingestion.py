@@ -357,3 +357,14 @@ def test_the_vector_sink_is_built_for_the_requested_tenant(monkeypatch) -> None:
     sinks = build_vector_sinks({"TENANT_ID": "acme"})
     assert sinks[0].tenant_id == "acme"
     assert build_vector_sinks({})[0].tenant_id == "default"
+
+
+def test_malformed_graph_items_are_dropped_or_defaulted_not_fatal() -> None:
+    from pipelines.ingestion.indexing.neo4j import clean_graph
+
+    nodes, edges = clean_graph(
+        [{"id": "A", "type": "Concept"}, {"type": "Concept"}, "junk", {"id": None}],
+        [{"source": "A", "target": "B", "type": None}, {"source": "A"}, {"source": "A", "target": "B", "type": "PART_OF"}],
+    )
+    assert nodes == [{"id": "A", "type": "Concept"}]
+    assert [e["type"] for e in edges] == ["RELATES_TO", "PART_OF"]
