@@ -148,3 +148,48 @@ def test_manifest_and_terraform_wire_the_sweeper() -> None:
     tf = (ROOT / "infra/terraform/azure/iam.tf").read_text()
     assert "system:serviceaccount:default:ingest-sweeper" in tf
     assert "ingest-sweeper-azure.yaml" in (ROOT / "scripts/deploy_ingestion_cluster_azure.sh").read_text()
+
+
+def test_a_refused_connection_to_the_ray_head_is_retried(monkeypatch) -> None:
+    import io
+    import urllib.error
+
+    from pipelines.ingestion import sweeper
+
+    calls = {"n": 0}
+
+    class _Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(request, timeout=0):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise urllib.error.URLError(ConnectionRefusedError(111, "refused"))
+        return _Response(b'{"status": "RUNNING"}')
+
+    monkeypatch.setattr(sweeper.urllib.request, "urlopen", fake_urlopen)
+    api = sweeper.RayJobApi(sleep=lambda _: None)
+    assert api.status("x") == "RUNNING" and calls["n"] == 3
+
+
+def test_a_ray_http_error_is_not_retried(monkeypatch) -> None:
+    import urllib.error
+
+    from pipelines.ingestion import sweeper
+
+    calls = {"n": 0}
+
+    def fake_urlopen(request, timeout=0):
+        calls["n"] += 1
+        raise urllib.error.HTTPError("u", 400, "bad", {}, None)
+
+    monkeypatch.setattr(sweeper.urllib.request, "urlopen", fake_urlopen)
+    try:
+        sweeper.RayJobApi(sleep=lambda _: None).status("x")
+    except urllib.error.HTTPError:
+        pass
+    assert calls["n"] == 1
