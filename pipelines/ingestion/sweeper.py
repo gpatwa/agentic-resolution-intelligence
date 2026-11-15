@@ -21,6 +21,7 @@ import os
 import re
 import ssl
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -243,16 +244,26 @@ class KubeRayCluster:
 class RayJobApi:
     """Ray's job submission REST API on the head service."""
 
-    def __init__(self, address: str = "http://rag-ray-cluster-head-svc:8265"):
+    def __init__(self, address: str = "http://rag-ray-cluster-head-svc:8265", *, attempts: int = 18, wait: float = 10.0,
+                 sleep: Callable[[float], None] = time.sleep):
         self.address = address.rstrip("/")
+        self.attempts, self.wait, self._sleep = attempts, wait, sleep
 
     def _call(self, method: str, path: str, body: Optional[dict] = None) -> Any:
+        """The head pod can be Ready a moment before its dashboard and the service accept connections, so a refused
+        connection is retried (about three minutes) instead of failing the blob."""
         data = json.dumps(body).encode() if body is not None else None
-        request = urllib.request.Request(f"{self.address}{path}", data=data, method=method)
-        if body is not None:
-            request.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(request, timeout=60) as response:
-            return json.loads(response.read() or b"{}")
+        for attempt in range(1, self.attempts + 1):
+            request = urllib.request.Request(f"{self.address}{path}", data=data, method=method)
+            if body is not None:
+                request.add_header("Content-Type", "application/json")
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    return json.loads(response.read() or b"{}")
+            except urllib.error.URLError as exc:
+                if isinstance(exc, urllib.error.HTTPError) or attempt == self.attempts:
+                    raise
+                self._sleep(self.wait)
 
     def submit(self, entrypoint: str, env_vars: Dict[str, str], submission_id: str) -> None:
         self._call(
