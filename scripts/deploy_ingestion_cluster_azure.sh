@@ -34,6 +34,14 @@ fi
 # Workers start at 0 replicas; scripts/ingest_azure.sh scales them up for a run and back down.
 sed "s#__INGESTION_IMAGE__#${INGEST_ACR_URI}/rag-ingestion:${INGEST_TAG}#g" deploy/ray/ray-cluster-azure.yaml | kubectl apply -f -
 
+# Automatic ingestion: a CronJob in the same image ingests whatever lands under uploads/<tenant>/ (pipelines/ingestion/sweeper.py).
+RAY_CLIENT_ID="${RAY_IDENTITY_CLIENT_ID:-$(kubectl get serviceaccount ray-worker -o jsonpath='{.metadata.annotations.azure\.workload\.identity/client-id}' 2>/dev/null || true)}"
+if [ -n "$RAY_CLIENT_ID" ]; then
+    sed -e "s#__INGESTION_IMAGE__#${INGEST_ACR_URI}/rag-ingestion:${INGEST_TAG}#g" \
+        -e "s#__RAY_IDENTITY_CLIENT_ID__#${RAY_CLIENT_ID}#g" deploy/ray/ingest-sweeper-azure.yaml | kubectl apply -f -
+else
+    echo "  ray-worker has no workload identity client id; skipping the automatic-ingestion CronJob"
+fi
 
 # KubeRay does not restart running pods for a changed image: recreate the head (and any worker) when the image moved.
 current="$(kubectl get pods -l ray.io/cluster=rag-ray-cluster -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null || true)"

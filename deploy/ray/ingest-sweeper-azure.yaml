@@ -1,0 +1,73 @@
+# deploy/ray/ingest-sweeper-azure.yaml
+# Automatic ingestion on Azure: every 10 minutes (while the cluster is up) a small pod ingests what was uploaded to
+# az://documents/uploads/<tenant>/... since the last pass, then suspends the Ray cluster again. See
+# pipelines/ingestion/sweeper.py. __INGESTION_IMAGE__ and __RAY_IDENTITY_CLIENT_ID__ are filled in by
+# scripts/deploy_ingestion_cluster_azure.sh.
+#
+# Its own service account (federated to the Ray identity in infra/terraform/azure/iam.tf) so the Ray pods themselves get
+# no Kubernetes API rights: this account may only read pods and read/patch the one RayCluster.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ingest-sweeper
+  namespace: default
+  annotations:
+    azure.workload.identity/client-id: "__RAY_IDENTITY_CLIENT_ID__"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ingest-sweeper
+  namespace: default
+rules:
+  - apiGroups: ["ray.io"]
+    resources: ["rayclusters"]
+    resourceNames: ["rag-ray-cluster"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ingest-sweeper
+  namespace: default
+subjects:
+  - kind: ServiceAccount
+    name: ingest-sweeper
+    namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ingest-sweeper
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ingest-sweeper
+  namespace: default
+spec:
+  schedule: "*/10 * * * *"
+  concurrencyPolicy: Forbid          # a long ingestion must not overlap the next pass
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  startingDeadlineSeconds: 300
+  jobTemplate:
+    spec:
+      backoffLimit: 0                # failed blobs are retried by the next pass, within INGEST_MAX_ATTEMPTS
+      activeDeadlineSeconds: 14400
+      template:
+        metadata:
+          labels:
+            azure.workload.identity/use: "true"
+        spec:
+          serviceAccountName: ingest-sweeper
+          restartPolicy: Never
+          containers:
+            - name: sweeper
+              image: __INGESTION_IMAGE__
+              command: ["python", "-m", "pipelines.ingestion.sweeper"]
+              resources:
+                requests: {cpu: 20m, memory: 96Mi}
+                limits: {cpu: 250m, memory: 256Mi}
