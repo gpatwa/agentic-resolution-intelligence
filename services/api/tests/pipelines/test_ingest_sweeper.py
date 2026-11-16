@@ -143,7 +143,7 @@ def test_manifest_and_terraform_wire_the_sweeper() -> None:
     assert pod["spec"]["serviceAccountName"] == "ingest-sweeper"
     assert pod["spec"]["containers"][0]["image"] == "__INGESTION_IMAGE__"
     verbs = {(r["resources"][0], tuple(r["verbs"])) for r in kinds["Role"]["rules"]}
-    assert verbs == {("rayclusters", ("get", "patch")), ("pods", ("get", "list"))}
+    assert ("rayclusters", ("get", "patch")) in verbs and ("pods", ("get", "list")) in verbs
     assert (ROOT / "pipelines/jobs/ray_job.yaml").exists()
     tf = (ROOT / "infra/terraform/azure/iam.tf").read_text()
     assert "system:serviceaccount:default:ingest-sweeper" in tf
@@ -193,3 +193,120 @@ def test_a_ray_http_error_is_not_retried(monkeypatch) -> None:
     except urllib.error.HTTPError:
         pass
     assert calls["n"] == 1
+
+
+# ----- the ingestion lock ------------------------------------------------------------------------------------------------
+
+
+class _FakeKube:
+    """Just enough of the Lease API: POST 409s when it exists, PUT replaces, DELETE removes."""
+
+    def __init__(self, lease=None):
+        self.lease, self.calls = lease, []
+
+    def __call__(self, method, path, body=None, patch=False):
+        import urllib.error
+
+        self.calls.append(method)
+        if method == "POST":
+            if self.lease is not None:
+                raise urllib.error.HTTPError(path, 409, "exists", {}, None)
+            self.lease = body
+            return body
+        if self.lease is None:
+            raise urllib.error.HTTPError(path, 404, "gone", {}, None)
+        if method == "GET":
+            return {**self.lease}
+        if method == "PUT":
+            self.lease = body
+            return body
+        if method == "DELETE":
+            self.lease = None
+            return {}
+        raise AssertionError(method)
+
+
+def _lease(kube, holder, now=NOW):
+    from pipelines.ingestion.sweeper import KubeLease
+
+    return KubeLease(kube, holder, now=lambda: now)
+
+
+def test_a_free_lease_is_taken_and_released() -> None:
+    kube = _FakeKube()
+    lock = _lease(kube, "a")
+    assert lock.acquire() and kube.lease["spec"]["holderIdentity"] == "a"
+    lock.release()
+    assert kube.lease is None
+
+
+def test_a_lease_held_by_someone_else_is_not_taken_until_it_expires() -> None:
+    kube = _FakeKube()
+    assert _lease(kube, "a").acquire()
+    assert not _lease(kube, "b", NOW + timedelta(seconds=600)).acquire()
+    assert kube.lease["spec"]["holderIdentity"] == "a"
+    assert _lease(kube, "b", NOW + timedelta(seconds=1300)).acquire()  # past leaseDurationSeconds (1200)
+    assert kube.lease["spec"]["holderIdentity"] == "b"
+
+
+def test_only_the_holder_can_release_and_a_lost_lease_is_noticed_on_renew() -> None:
+    kube = _FakeKube()
+    a = _lease(kube, "a")
+    a.acquire()
+    _lease(kube, "b").release()
+    assert kube.lease is not None
+    kube.lease["spec"]["holderIdentity"] = "b"
+    try:
+        a.renew()
+        raise AssertionError("renew should fail")
+    except RuntimeError:
+        pass
+
+
+def test_a_pass_that_cannot_get_the_lock_does_nothing() -> None:
+    class _Busy:
+        def acquire(self):
+            return False
+
+        def release(self):
+            raise AssertionError("must not release a lock it never held")
+
+    cluster = _Cluster()
+    report = _sweep(_Store([_blob("uploads/t/a.pdf")]), cluster, _Ray(), lock=_Busy())
+    assert report["skipped"] == 1 and report["succeeded"] == 0 and cluster.events == []
+
+
+def test_a_pass_holds_the_lock_while_it_runs_and_releases_it_even_on_failure() -> None:
+    log = []
+
+    class _Lock:
+        def acquire(self):
+            log.append("acquire")
+            return True
+
+        def renew(self):
+            log.append("renew")
+
+        def release(self):
+            log.append("release")
+
+    class _Slow(_Cluster):
+        def wait_ready(self):
+            raise RuntimeError("boom")
+
+    try:
+        _sweep(_Store([_blob("uploads/t/a.pdf")]), _Slow(), _Ray(), lock=_Lock())
+    except RuntimeError:
+        pass
+    assert log == ["acquire", "release"]
+    log.clear()
+    _sweep(_Store([_blob("uploads/t/a.pdf")]), _Cluster(), _Ray(), lock=_Lock())
+    assert log[0] == "acquire" and "renew" in log and log[-1] == "release"
+
+
+def test_the_manual_script_and_the_role_use_the_same_lease() -> None:
+    script = (ROOT / "scripts/ingest_azure.sh").read_text()
+    assert "kind: Lease" in script and "name: ingest-sweeper" in script and "acquire_lease || exit 1" in script
+    role = [d for d in yaml.safe_load_all((ROOT / "deploy/ray/ingest-sweeper-azure.yaml").read_text()) if d["kind"] == "Role"][0]
+    lease_rules = [r for r in role["rules"] if r["resources"] == ["leases"]]
+    assert {v for r in lease_rules for v in r["verbs"]} == {"create", "get", "update", "delete"}

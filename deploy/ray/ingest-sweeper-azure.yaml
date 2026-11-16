@@ -24,6 +24,13 @@ rules:
     resources: ["rayclusters"]
     resourceNames: ["rag-ray-cluster"]
     verbs: ["get", "patch"]
+  - apiGroups: ["coordination.k8s.io"]   # the mutex that keeps two ingestion passes apart
+    resources: ["leases"]
+    verbs: ["create"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["ingest-sweeper"]
+    verbs: ["get", "update", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list"]

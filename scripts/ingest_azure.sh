@@ -39,7 +39,28 @@ scale_workers() {  # scale_workers <replicas>
   kubectl patch raycluster "$cluster" --type json \
     -p "[{\"op\":\"replace\",\"path\":\"/spec/workerGroupSpecs/0/replicas\",\"value\":$1}]" >/dev/null
 }
+# One ingestion at a time: the automatic sweeper (pipelines/ingestion/sweeper.py) holds the Lease "ingest-sweeper" while it
+# ingests. Ingesting the same file twice at once leaves duplicate graph entities, so wait for it instead.
+lease_held=0
+release_lease() { [ "$lease_held" = 1 ] && kubectl delete lease ingest-sweeper >/dev/null 2>&1 || true; }
+acquire_lease() {
+  local now; now="$(date -u +%Y-%m-%dT%H:%M:%S.000000Z)"
+  for _ in $(seq 1 90); do  # up to 15 minutes
+    if kubectl create -f - >/dev/null 2>&1 <<LEASE
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata: {name: ingest-sweeper}
+spec: {holderIdentity: "manual-$$", leaseDurationSeconds: 3600, renewTime: "$now"}
+LEASE
+    then lease_held=1; return 0; fi
+    echo "  another ingestion holds the lock (holder: $(kubectl get lease ingest-sweeper -o jsonpath='{.spec.holderIdentity}' 2>/dev/null)); waiting..."
+    sleep 10
+  done
+  echo "could not get the ingestion lock; if a crashed run left it, delete it: kubectl delete lease ingest-sweeper" >&2
+  return 1
+}
 cleanup() {
+  release_lease
   if [ "${KEEP_RUNNING:-${KEEP_WORKERS:-0}}" != "1" ]; then
     echo "Scaling Ray workers to 0 and suspending the cluster..."
     scale_workers 0 || true
@@ -47,6 +68,8 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+acquire_lease || exit 1
 
 # --- 1. upload --------------------------------------------------------------------------------------------------------
 echo "Uploading to az://${container}/${prefix} ..."

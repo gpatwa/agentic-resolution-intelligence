@@ -79,6 +79,7 @@ def run_pass(
     store: Any,
     cluster: Any,
     ray: Any,
+    lock: Any = None,
     base_env: Dict[str, str],
     container: str,
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
@@ -88,7 +89,24 @@ def run_pass(
     job_timeout: int = 2700,
     poll_seconds: int = 15,
 ) -> Dict[str, int]:
-    """One sweep. ``store``, ``cluster`` and ``ray`` are the Blob, Kubernetes and Ray-job adapters (fakes in tests)."""
+    """One sweep. ``store``, ``cluster`` and ``ray`` are the Blob, Kubernetes and Ray-job adapters (fakes in tests).
+
+    ``lock`` (a Kubernetes Lease in production) keeps two passes, or a pass and ``scripts/ingest_azure.sh``, from ingesting
+    at the same time: the graph extractor names entities differently on each run, so the same file ingested twice at once
+    leaves duplicate entities. A pass that cannot take the lock does nothing and the next one tries again."""
+    if lock is not None and not lock.acquire():
+        print("sweep: another ingestion holds the lock; skipping this pass")
+        return {"pending": 0, "succeeded": 0, "failed": 0, "skipped": 1}
+    try:
+        return _sweep(store, cluster, ray, lock, base_env, container, now, sleep, quiet_seconds, max_attempts,
+                      job_timeout, poll_seconds)
+    finally:
+        if lock is not None:
+            lock.release()
+
+
+def _sweep(store, cluster, ray, lock, base_env, container, now, sleep, quiet_seconds, max_attempts, job_timeout,
+           poll_seconds) -> Dict[str, int]:
     state = store.load_state()
     pending = find_pending(store.list_uploads(), state, now(), quiet_seconds, max_attempts)
     report = {"pending": len(pending), "succeeded": 0, "failed": 0}
@@ -113,7 +131,7 @@ def run_pass(
                     job_env(base_env, tenant),
                     submission_id,
                 )
-                status = _wait_for_job(ray, submission_id, sleep, job_timeout, poll_seconds)
+                status = _wait_for_job(ray, submission_id, sleep, job_timeout, poll_seconds, lock)
             except Exception as exc:  # one bad blob must not stop the rest
                 print(f"sweep: {blob.name}: {exc}")
             entry["done"] = status == "SUCCEEDED"
@@ -127,9 +145,12 @@ def run_pass(
     return report
 
 
-def _wait_for_job(ray: Any, submission_id: str, sleep: Callable[[float], None], timeout: int, poll: int) -> str:
+def _wait_for_job(ray: Any, submission_id: str, sleep: Callable[[float], None], timeout: int, poll: int,
+                  lock: Any = None) -> str:
     waited = 0
     while waited <= timeout:
+        if lock is not None:
+            lock.renew()
         status = (ray.status(submission_id) or "").upper()
         if status in ("SUCCEEDED", "FAILED", "STOPPED"):
             return status
@@ -241,6 +262,65 @@ class KubeRayCluster:
         raise RuntimeError("the Ray head and a worker did not become Ready in time")
 
 
+class KubeLease:
+    """A ``coordination.k8s.io`` Lease used as a mutex. Held while a pass runs, renewed while it waits for jobs, deleted at
+    the end. A holder that died stops renewing, and the lease can be taken over once ``duration`` seconds have passed."""
+
+    def __init__(self, request: Callable[..., Any], holder: str, name: str = "ingest-sweeper", namespace: str = "default",
+                 duration: int = 1200, now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
+        self._request, self.holder, self.name, self.namespace = request, holder, name, namespace
+        self.duration, self._now = duration, now
+
+    def _path(self, with_name: bool = True) -> str:
+        base = f"/apis/coordination.k8s.io/v1/namespaces/{self.namespace}/leases"
+        return f"{base}/{self.name}" if with_name else base
+
+    def _spec(self) -> Dict[str, Any]:
+        return {"holderIdentity": self.holder, "leaseDurationSeconds": self.duration,
+                "renewTime": self._now().strftime("%Y-%m-%dT%H:%M:%S.%fZ")}
+
+    def acquire(self) -> bool:
+        body = {"apiVersion": "coordination.k8s.io/v1", "kind": "Lease", "metadata": {"name": self.name},
+                "spec": self._spec()}
+        try:
+            self._request("POST", self._path(False), body)
+            return True
+        except urllib.error.HTTPError as exc:
+            if exc.code != 409:
+                raise
+        current = self._request("GET", self._path())
+        spec = current.get("spec", {})
+        if spec.get("holderIdentity") == self.holder:
+            return True
+        renewed = datetime.strptime(spec["renewTime"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+        if (self._now() - renewed).total_seconds() < spec.get("leaseDurationSeconds", self.duration):
+            return False
+        current["spec"] = self._spec()  # expired: take over; the resourceVersion makes a race fail with 409
+        try:
+            self._request("PUT", self._path(), current)
+            return True
+        except urllib.error.HTTPError as exc:
+            if exc.code == 409:
+                return False
+            raise
+
+    def renew(self) -> None:
+        current = self._request("GET", self._path())
+        if current.get("spec", {}).get("holderIdentity") != self.holder:
+            raise RuntimeError("the ingestion lock was lost to another holder")
+        current["spec"] = self._spec()
+        self._request("PUT", self._path(), current)
+
+    def release(self) -> None:
+        try:
+            current = self._request("GET", self._path())
+            if current.get("spec", {}).get("holderIdentity") == self.holder:
+                self._request("DELETE", self._path())
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                raise
+
+
 class RayJobApi:
     """Ray's job submission REST API on the head service."""
 
@@ -284,9 +364,11 @@ def main() -> int:
         base_env = {k: str(v) for k, v in yaml.safe_load(handle)["runtime_env"]["env_vars"].items()}
     account = os.environ.get("AZURE_STORAGE_ACCOUNT_NAME") or base_env["AZURE_STORAGE_ACCOUNT_NAME"]
     container = os.environ.get("INGEST_CONTAINER", "documents")
+    cluster = KubeRayCluster()
     report = run_pass(
         store=AzureBlobStore(account, container),
-        cluster=KubeRayCluster(),
+        cluster=cluster,
+        lock=KubeLease(cluster._request, holder=os.environ.get("HOSTNAME", "sweeper")),
         ray=RayJobApi(),
         base_env=base_env,
         container=container,
