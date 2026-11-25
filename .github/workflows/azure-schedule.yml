@@ -5,6 +5,7 @@
 #   start  Mon-Fri 14:00 UTC  (6am PST / 7am PDT)
 #   stop   Tue-Sat 02:00 UTC  (6pm PST / 7pm PDT, the evening of Mon-Fri)   -> down nights and weekends
 #
+# Crons sit off the hour (14:17 and 01:43 UTC) because GitHub delays scheduled runs at the top of the hour by hours.
 # For an internal or few-customer deployment. The API is unavailable while stopped, and takes about 5 minutes to come back
 # after a start. Redis cannot be stopped and keeps billing. Manual runs: Actions > Azure schedule > Run workflow (start, stop
 # or status). To keep the stack up for a day (a demo), set the repository variable SCHEDULE_PAUSED=true; remove it to resume.
@@ -15,8 +16,8 @@ name: Azure schedule
 
 on:
   schedule:
-    - cron: "0 14 * * 1-5"
-    - cron: "0 2 * * 2-6"
+    - cron: "17 14 * * 1-5"
+    - cron: "43 1 * * 2-6"
   workflow_dispatch:
     inputs:
       action:
@@ -62,8 +63,8 @@ jobs:
           set -euo pipefail
           if [ "$EVENT" = "schedule" ]; then
             case "$CRON" in
-              "0 14 * * 1-5") action=start ;;
-              "0 2 * * 2-6")  action=stop ;;
+              "17 14 * * 1-5") action=start ;;
+              "43 1 * * 2-6")  action=stop ;;
               *) echo "unknown schedule: $CRON" >&2; exit 1 ;;
             esac
           else
