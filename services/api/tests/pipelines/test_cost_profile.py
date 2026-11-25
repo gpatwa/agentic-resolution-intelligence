@@ -140,7 +140,7 @@ def _run_script() -> str:
 
 def test_the_schedule_is_up_in_working_hours_and_down_nights_and_weekends() -> None:
     crons = [s["cron"] for s in _workflow()[True]["schedule"]]
-    assert sorted(crons) == ["0 14 * * 1-5", "0 2 * * 2-6"]
+    assert sorted(crons) == ["17 14 * * 1-5", "43 1 * * 2-6"]
     # start Mon-Fri 14:00 UTC, stop 02:00 UTC the next day (Tue-Sat): 12 hours up, five days a week
     hours_up = 5 * (24 - 14 + 2)
     assert hours_up == 60 and hours_up / 168 < 0.4, "the saving assumed in the cost analysis is ~36% uptime"
